@@ -117,6 +117,38 @@ with st.sidebar.expander("Backup / restore"):
         except Exception as e:
             st.error(f"Couldn't read that file: {e}")
 
+mergeable_names = {n for seq in rigs.mergeable_sequences(job.rig_name) for n in seq["bays"]}
+mergeable_candidates = [b.name for b in job.bays if b.name in mergeable_names]
+if mergeable_candidates or job.merge_groups:
+    with st.sidebar.expander("Merge pipe bays"):
+        if mergeable_candidates:
+            to_merge = st.multiselect(
+                "Select adjacent bays to merge",
+                mergeable_candidates,
+                key="merge_select",
+                help="Only bays next to each other can be merged (e.g. 2-3, 3-4-5), and they must be empty first.",
+            )
+            if st.button("Merge selected"):
+                try:
+                    models.merge_bays(job, to_merge)
+                    _save()
+                    st.rerun()
+                except ValueError as e:
+                    st.warning(str(e))
+        if job.merge_groups:
+            st.caption("Currently merged:")
+            for group in job.merge_groups:
+                merged_name = models.merged_bay_name(group)
+                mcol1, mcol2 = st.columns([3, 1])
+                mcol1.write(merged_name)
+                if mcol2.button("Split", key=f"unmerge_{merged_name}"):
+                    try:
+                        models.unmerge_bay(job, merged_name)
+                        _save()
+                        st.rerun()
+                    except ValueError as e:
+                        st.warning(str(e))
+
 st.sidebar.header("Joint types (legend)")
 with st.sidebar.expander("Add joint type"):
     jt_name = st.text_input("Name", key="new_jt_name")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, asdict
 
 import pipe_sizes
@@ -64,6 +65,7 @@ class Job:
     rig_name: str = ""
     bays: list[Bay] = field(default_factory=list)
     joint_types: list[JointType] = field(default_factory=list)
+    merge_groups: list[list[str]] = field(default_factory=list)  # groups of original bay names now merged
 
     def get_bay(self, bay_name: str) -> Bay | None:
         return next((b for b in self.bays if b.name == bay_name), None)
@@ -101,6 +103,107 @@ def add_joint_type(job: Job, name: str, ring_color: str, label: str | None = Non
 
 def remove_joint_type(job: Job, name: str) -> None:
     job.joint_types = [t for t in job.joint_types if t.name != name]
+
+
+# ---------------------------------------------------------------- bay merging
+# Some adjacent bays are separated by a removable post (see rigs.mergeable_sequences).
+# Merging/unmerging is only allowed while the affected bays are empty, so there's never
+# any ambiguity about which original bay a joint "belongs to" when splitting back apart.
+
+
+def _mergeable_sequence_for(rig_name: str, bay_name: str) -> dict | None:
+    for seq in rigs.mergeable_sequences(rig_name):
+        if bay_name in seq["bays"]:
+            return seq
+    return None
+
+
+def merged_bay_name(bay_names: list[str]) -> str:
+    """A readable name for a merge group, e.g. ["Pipe Bay 2", "Pipe Bay 3"] -> "Pipe Bay 2-3"."""
+    parsed = [re.match(r"^(.*?)(\d+)$", n) for n in bay_names]
+    if all(parsed) and len({m.group(1) for m in parsed}) == 1:
+        prefix = parsed[0].group(1)
+        nums = [m.group(2) for m in parsed]
+        return f"{prefix}{nums[0]}-{nums[-1]}" if len(nums) > 1 else f"{prefix}{nums[0]}"
+    return "+".join(bay_names)
+
+
+def can_merge(job: Job, bay_names: list[str]) -> str | None:
+    """Returns an error message if bay_names can't be merged right now, else None."""
+    if len(bay_names) < 2:
+        return "Select at least two bays to merge."
+    seq = _mergeable_sequence_for(job.rig_name, bay_names[0])
+    if seq is None or not all(n in seq["bays"] for n in bay_names):
+        return "All selected bays must be from the same mergeable group."
+    seq_order = seq["bays"]
+    indices = sorted(seq_order.index(n) for n in bay_names)
+    if indices != list(range(indices[0], indices[0] + len(indices))):
+        return "Only bays next to each other can be merged."
+    for name in bay_names:
+        bay = job.get_bay(name)
+        if bay is None:
+            return f"'{name}' isn't currently available to merge (already part of another merge?)."
+        if bay.count() > 0:
+            return f"'{name}' must be empty before merging — clear or remove its joints first."
+    return None
+
+
+def merge_bays(job: Job, bay_names: list[str]) -> None:
+    error = can_merge(job, bay_names)
+    if error:
+        raise ValueError(error)
+    seq = _mergeable_sequence_for(job.rig_name, bay_names[0])
+    post_thickness_m = seq["post_thickness_m"]
+    ordered_names = [n for n in seq["bays"] if n in bay_names]
+    component_bays = [job.get_bay(n) for n in ordered_names]
+    n = len(component_bays)
+    merged_length_m = sum(b.length_m for b in component_bays) + post_thickness_m * (n - 1)
+    merged_height_m = component_bays[0].height_m
+
+    diameters = set()
+    for b in component_bays:
+        diameters.update(b.row_capacity_overrides.keys())
+    merged_overrides = {}
+    for d in diameters:
+        if all(d in b.row_capacity_overrides for b in component_bays):
+            base = sum(b.row_capacity_overrides[d] for b in component_bays)
+            extra = int((post_thickness_m * (n - 1)) / pitch_m(d) + 1e-9)
+            merged_overrides[d] = base + extra
+
+    merged_bay = Bay(
+        name=merged_bay_name(ordered_names),
+        length_m=merged_length_m,
+        height_m=merged_height_m,
+        row_capacity_overrides=merged_overrides,
+    )
+    first_index = min(job.bays.index(b) for b in component_bays)
+    job.bays = [b for b in job.bays if b not in component_bays]
+    job.bays.insert(first_index, merged_bay)
+    job.merge_groups.append(ordered_names)
+
+
+def unmerge_bay(job: Job, bay_name: str) -> None:
+    bay = job.get_bay(bay_name)
+    if bay is None:
+        raise ValueError(f"'{bay_name}' not found.")
+    group = next((g for g in job.merge_groups if merged_bay_name(g) == bay_name), None)
+    if group is None:
+        raise ValueError(f"'{bay_name}' isn't a merged bay.")
+    if bay.count() > 0:
+        raise ValueError(f"'{bay_name}' must be empty before splitting it back apart.")
+    specs = {s["name"]: s for s in rigs.bay_specs(job.rig_name)}
+    restored = [
+        Bay(
+            name=name,
+            length_m=specs[name]["length_m"],
+            height_m=specs[name]["height_m"],
+            row_capacity_overrides=dict(specs[name].get("row_capacity", {})),
+        )
+        for name in group
+    ]
+    index = job.bays.index(bay)
+    job.bays = job.bays[:index] + restored + job.bays[index + 1 :]
+    job.merge_groups.remove(group)
 
 
 # ---------------------------------------------------------------- physical packing
@@ -253,4 +356,10 @@ def job_from_dict(data: dict) -> Job:
         )
         for b in data.get("bays", [])
     ]
-    return Job(name=data["name"], rig_name=data.get("rig_name", ""), bays=bays, joint_types=joint_types)
+    return Job(
+        name=data["name"],
+        rig_name=data.get("rig_name", ""),
+        bays=bays,
+        joint_types=joint_types,
+        merge_groups=data.get("merge_groups", []),
+    )

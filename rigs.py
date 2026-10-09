@@ -14,60 +14,74 @@ hardware, etc.), so row_capacity lets you pin the exact real joints-per-row
 for specific sizes. Sizes not listed there still fall back to the formula.
 row_capacity keys are diameter in inches, matching pipe_sizes.py.
 
+mergeable_sequences: some adjacent bays are separated by removable posts, so
+they can be combined into one bigger bay for planning purposes (see
+models.merge_bays). Each sequence lists the bays in physical left-to-right
+order — only a contiguous run within one sequence can be merged together —
+plus the post's thickness, which becomes extra usable length once removed.
+
 Bays are listed in the order they should be drawn, left to right.
 """
 
-RIG_LAYOUTS: dict[str, list[dict]] = {
-    "COSL Innovator": [
-        {
-            "name": "Riser Bay 1",
-            "length_m": 4.35,
-            "height_m": 4.2,
-            "row_capacity": {20.0: 7, 12.25: 12, 9.625: 17},
-        },
-        {
-            "name": "Riser Bay 2",
-            "length_m": 2.48,
-            "height_m": 4.2,
-            "row_capacity": {20.0: 4, 12.25: 6, 9.625: 9},
-        },
-        {
-            "name": "Riser Bay 3",
-            "length_m": 2.48,
-            "height_m": 4.2,
-            "row_capacity": {20.0: 4, 12.25: 6, 9.625: 9},
-        },
-        {
-            "name": "Pipe Bay 1",
-            "length_m": 3.0,
-            "height_m": 2.14,
-            "row_capacity": {20.0: 4, 12.25: 7, 9.625: 11},
-        },
-        {
-            "name": "Pipe Bay 2",
-            "length_m": 2.5,
-            "height_m": 2.14,
-            "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
-        },
-        {
-            "name": "Pipe Bay 3",
-            "length_m": 2.56,
-            "height_m": 2.14,
-            "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
-        },
-        {
-            "name": "Pipe Bay 4",
-            "length_m": 2.6,
-            "height_m": 2.14,
-            "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
-        },
-        {
-            "name": "Pipe Bay 5",
-            "length_m": 2.6,
-            "height_m": 2.14,
-            "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
-        },
-    ],
+RIG_LAYOUTS: dict[str, dict] = {
+    "COSL Innovator": {
+        "bays": [
+            {
+                "name": "Riser Bay 1",
+                "length_m": 4.35,
+                "height_m": 4.2,
+                "row_capacity": {20.0: 7, 12.25: 12, 9.625: 17},
+            },
+            {
+                "name": "Riser Bay 2",
+                "length_m": 2.48,
+                "height_m": 4.2,
+                "row_capacity": {20.0: 4, 12.25: 6, 9.625: 9},
+            },
+            {
+                "name": "Riser Bay 3",
+                "length_m": 2.48,
+                "height_m": 4.2,
+                "row_capacity": {20.0: 4, 12.25: 6, 9.625: 9},
+            },
+            {
+                "name": "Pipe Bay 1",
+                "length_m": 3.0,
+                "height_m": 2.14,
+                "row_capacity": {20.0: 4, 12.25: 7, 9.625: 11},
+            },
+            {
+                "name": "Pipe Bay 2",
+                "length_m": 2.5,
+                "height_m": 2.14,
+                "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
+            },
+            {
+                "name": "Pipe Bay 3",
+                "length_m": 2.56,
+                "height_m": 2.14,
+                "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
+            },
+            {
+                "name": "Pipe Bay 4",
+                "length_m": 2.6,
+                "height_m": 2.14,
+                "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
+            },
+            {
+                "name": "Pipe Bay 5",
+                "length_m": 2.6,
+                "height_m": 2.14,
+                "row_capacity": {20.0: 4, 12.25: 6, 9.625: 10},
+            },
+        ],
+        "mergeable_sequences": [
+            {
+                "bays": ["Pipe Bay 2", "Pipe Bay 3", "Pipe Bay 4", "Pipe Bay 5"],
+                "post_thickness_m": 0.40,
+            },
+        ],
+    },
 }
 
 
@@ -78,4 +92,10 @@ def rig_names() -> list[str]:
 def bay_specs(rig_name: str) -> list[dict]:
     if rig_name not in RIG_LAYOUTS:
         raise ValueError(f"Unknown rig '{rig_name}'.")
-    return RIG_LAYOUTS[rig_name]
+    return RIG_LAYOUTS[rig_name]["bays"]
+
+
+def mergeable_sequences(rig_name: str) -> list[dict]:
+    if rig_name not in RIG_LAYOUTS:
+        raise ValueError(f"Unknown rig '{rig_name}'.")
+    return RIG_LAYOUTS[rig_name].get("mergeable_sequences", [])
