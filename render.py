@@ -260,5 +260,5 @@ def build_figure(job: Job, zoom: float = 1.0, only_bays: list[str] | None = None
     ax.set_ylim(footer_y0 - footer_rows * LEGEND_ROW_HEIGHT - 0.3, title_top + TOP_MARGIN)
     ax.set_aspect("equal")
     ax.axis("off")
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     return fig

@@ -205,6 +205,9 @@ else:
     bay_names = [b.name for b in job.bays]
     selected_bay_name = st.selectbox("Bay", bay_names, key="selected_bay")
     bay = job.get_bay(selected_bay_name)
+    if bay is None:
+        st.error(f"Bay '{selected_bay_name}' not found.")
+        st.stop()
 
     type_options = [t.name for t in job.joint_types]
     c1, c2, c3, c4 = st.columns(4)
