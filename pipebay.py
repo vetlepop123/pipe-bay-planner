@@ -253,14 +253,17 @@ else:
     ac1, ac2, ac3 = st.columns(3)
     with ac1:
         if st.button("Add joints", disabled=not type_options):
-            try:
-                if max_per_layer > 0:
-                    models.set_row_capacity_override(bay, add_diameter, int(max_per_layer))
-                models.add_joints(bay, sel_type, int(add_count), float(add_diameter), add_label.strip() or None)
-                _save()
-                st.rerun()
-            except ValueError as e:
-                st.warning(str(e))
+            if sel_type is None:
+                st.warning("Define a joint type first.")
+            else:
+                try:
+                    if max_per_layer > 0:
+                        models.set_row_capacity_override(bay, add_diameter, int(max_per_layer))
+                    models.add_joints(bay, sel_type, int(add_count), float(add_diameter), add_label.strip() or None)
+                    _save()
+                    st.rerun()
+                except ValueError as e:
+                    st.warning(str(e))
     with ac2:
         remove_count = st.number_input("Remove count", min_value=1, value=1, step=1, key="remove_count")
         if st.button("Remove joints"):
