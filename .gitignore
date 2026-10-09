@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Real job data stays local — never commit your actual deck plans.
+data/
+
+# Local secrets (app_password etc.) — never commit, set via Streamlit Cloud's Secrets UI instead.
+.streamlit/secrets.toml
