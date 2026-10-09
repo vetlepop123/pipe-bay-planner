@@ -46,7 +46,10 @@ if not _check_password():
 
 
 def _save() -> None:
-    storage.save_job(st.session_state.job)
+    try:
+        storage.save_job(st.session_state.job)
+    except Exception as e:
+        st.warning(f"Your change applied, but saving to disk failed: {e}")
 
 
 # ---------------------------------------------------------------- job setup
@@ -54,9 +57,19 @@ PIPE_SIZE_OPTIONS = pipe_sizes.options()
 PIPE_SIZE_LABELS = [label for label, _ in PIPE_SIZE_OPTIONS]
 PIPE_SIZE_BY_LABEL = dict(PIPE_SIZE_OPTIONS)
 
+
+def _load_job_safely(name: str) -> models.Job | None:
+    try:
+        return storage.load_job(name)
+    except Exception as e:
+        st.warning(f"Couldn't load job '{name}' ({e}).")
+        return None
+
+
 if "job" not in st.session_state:
     existing = storage.list_jobs()
-    st.session_state.job = storage.load_job(existing[0]) if existing else models.new_job("New Job", rigs.rig_names()[0])
+    loaded = _load_job_safely(existing[0]) if existing else None
+    st.session_state.job = loaded or models.new_job("New Job", rigs.rig_names()[0])
 
 job = st.session_state.job
 
@@ -65,8 +78,10 @@ existing_jobs = storage.list_jobs()
 job_options = existing_jobs if job.name in existing_jobs else [job.name] + existing_jobs
 selected = st.sidebar.selectbox("Current job", job_options, index=job_options.index(job.name))
 if selected != job.name:
-    st.session_state.job = storage.load_job(selected)
-    st.rerun()
+    loaded = _load_job_safely(selected)
+    if loaded is not None:
+        st.session_state.job = loaded
+        st.rerun()
 
 with st.sidebar.expander("New job"):
     new_name = st.text_input("Job name", key="new_job_name")
@@ -90,10 +105,16 @@ with st.sidebar.expander("Rename / delete job"):
             old_name = job.name
             job.name = new_name
             _save()
-            storage.delete_job(old_name)
+            try:
+                storage.delete_job(old_name)
+            except Exception as e:
+                st.warning(f"Renamed, but couldn't remove the old file '{old_name}': {e}")
             st.rerun()
     if rcol2.button("Delete job"):
-        storage.delete_job(job.name)
+        try:
+            storage.delete_job(job.name)
+        except Exception as e:
+            st.warning(f"Couldn't delete '{job.name}': {e}")
         st.session_state.job = models.new_job("New Job", rigs.rig_names()[0])
         st.rerun()
 
@@ -117,7 +138,10 @@ with st.sidebar.expander("Backup / restore"):
         except Exception as e:
             st.error(f"Couldn't read that file: {e}")
 
-mergeable_names = {n for seq in rigs.mergeable_sequences(job.rig_name) for n in seq["bays"]}
+try:
+    mergeable_names = {n for seq in rigs.mergeable_sequences(job.rig_name) for n in seq["bays"]}
+except ValueError:
+    mergeable_names = set()  # job's rig no longer exists in rigs.py — nothing to offer merging on
 mergeable_candidates = [b.name for b in job.bays if b.name in mergeable_names]
 if mergeable_candidates or job.merge_groups:
     with st.sidebar.expander("Merge pipe bays"):
@@ -198,10 +222,37 @@ else:
         placeholder = f'e.g. "{selected_type.label}", or leave blank to number' if selected_type and selected_type.label else "leave blank to number automatically"
         add_label = st.text_input("Label (optional)", key="add_label", placeholder=placeholder)
 
+    mc1, mc2 = st.columns([2, 1])
+    with mc1:
+        current_override = bay.row_capacity_overrides.get(add_diameter)
+        current_effective = models.effective_row_capacity(bay, add_diameter)
+        source = "manually set" if current_override is not None else "automatic"
+        max_per_layer = st.number_input(
+            "Max per layer for this size (optional)",
+            min_value=0,
+            value=0,
+            step=1,
+            # Keyed to the current bay+size so switching either resets this to 0, rather than
+            # silently carrying a leftover override value onto a bay/size it was never meant for.
+            key=f"max_per_layer_{bay.name}_{add_diameter}",
+            help=f"Currently {current_effective} per layer in '{bay.name}' ({source}). "
+            "Leave at 0 to keep that; set a number to override it for this size in this bay going forward.",
+        )
+    with mc2:
+        st.write("")
+        st.write("")
+        if current_override is not None:
+            if st.button("Reset to automatic"):
+                models.clear_row_capacity_override(bay, add_diameter)
+                _save()
+                st.rerun()
+
     ac1, ac2, ac3 = st.columns(3)
     with ac1:
         if st.button("Add joints", disabled=not type_options):
             try:
+                if max_per_layer > 0:
+                    models.set_row_capacity_override(bay, add_diameter, int(max_per_layer))
                 models.add_joints(bay, sel_type, int(add_count), float(add_diameter), add_label.strip() or None)
                 _save()
                 st.rerun()
@@ -282,17 +333,30 @@ else:
         snap_label = st.text_input("Save current state as", key="snap_label")
         if st.button("Save snapshot"):
             if snap_label.strip():
-                storage.save_snapshot(job, snap_label.strip())
-                st.success(f"Saved snapshot '{snap_label.strip()}'.")
+                try:
+                    storage.save_snapshot(job, snap_label.strip())
+                    st.success(f"Saved snapshot '{snap_label.strip()}'.")
+                except Exception as e:
+                    st.error(f"Couldn't save snapshot: {e}")
             else:
                 st.warning("Enter a snapshot name.")
     with scol2:
         snaps = storage.list_snapshots(job.name)
         if snaps:
-            snap_to_load = st.selectbox("Load snapshot", snaps, key="snap_load_select")
-            if st.button("Load snapshot"):
-                st.session_state.job = storage.load_snapshot(job.name, snap_to_load)
-                _save()
-                st.rerun()
+            snap_to_load = st.selectbox("Load / delete snapshot", snaps, key="snap_load_select")
+            lcol, dcol = st.columns(2)
+            if lcol.button("Load snapshot"):
+                try:
+                    st.session_state.job = storage.load_snapshot(job.name, snap_to_load)
+                    _save()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Couldn't load snapshot '{snap_to_load}': {e}")
+            if dcol.button("Delete snapshot"):
+                try:
+                    storage.delete_snapshot(job.name, snap_to_load)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Couldn't delete snapshot '{snap_to_load}': {e}")
         else:
             st.caption("No snapshots yet.")

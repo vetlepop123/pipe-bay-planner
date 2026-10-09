@@ -139,12 +139,16 @@ def can_merge(job: Job, bay_names: list[str]) -> str | None:
     indices = sorted(seq_order.index(n) for n in bay_names)
     if indices != list(range(indices[0], indices[0] + len(indices))):
         return "Only bays next to each other can be merged."
+    heights = set()
     for name in bay_names:
         bay = job.get_bay(name)
         if bay is None:
             return f"'{name}' isn't currently available to merge (already part of another merge?)."
         if bay.count() > 0:
             return f"'{name}' must be empty before merging — clear or remove its joints first."
+        heights.add(bay.height_m)
+    if len(heights) > 1:
+        return "Selected bays have different heights — can't merge them."
     return None
 
 
@@ -176,8 +180,9 @@ def merge_bays(job: Job, bay_names: list[str]) -> None:
         height_m=merged_height_m,
         row_capacity_overrides=merged_overrides,
     )
-    first_index = min(job.bays.index(b) for b in component_bays)
-    job.bays = [b for b in job.bays if b not in component_bays]
+    component_names = set(ordered_names)
+    first_index = min(i for i, b in enumerate(job.bays) if b.name in component_names)
+    job.bays = [b for b in job.bays if b.name not in component_names]
     job.bays.insert(first_index, merged_bay)
     job.merge_groups.append(ordered_names)
 
@@ -201,7 +206,7 @@ def unmerge_bay(job: Job, bay_name: str) -> None:
         )
         for name in group
     ]
-    index = job.bays.index(bay)
+    index = next(i for i, b in enumerate(job.bays) if b.name == bay_name)
     job.bays = job.bays[:index] + restored + job.bays[index + 1 :]
     job.merge_groups.remove(group)
 
@@ -259,6 +264,27 @@ def row_layout(bay: Bay) -> list[list[Joint]]:
     """Bottom-up rows of a bay's joints, packed by each joint's own diameter."""
     ordered = sorted(bay.joints, key=lambda j: j.order)
     return pack_rows(ordered, bay.length_m, bay.row_capacity_overrides)
+
+
+def formula_row_capacity(bay: Bay, diameter_in: float) -> int:
+    """What the length/pitch formula alone would give for this size, ignoring any override."""
+    return max(1, int(bay.length_m / pitch_m(diameter_in)))
+
+
+def effective_row_capacity(bay: Bay, diameter_in: float) -> int:
+    """The joints-per-row count actually used for this size: an override if set, else the formula."""
+    override = bay.row_capacity_overrides.get(diameter_in)
+    return override if override is not None else formula_row_capacity(bay, diameter_in)
+
+
+def set_row_capacity_override(bay: Bay, diameter_in: float, max_per_row: int) -> None:
+    if max_per_row < 1:
+        raise ValueError("Max per layer must be at least 1.")
+    bay.row_capacity_overrides[diameter_in] = max_per_row
+
+
+def clear_row_capacity_override(bay: Bay, diameter_in: float) -> None:
+    bay.row_capacity_overrides.pop(diameter_in, None)
 
 
 def _row_height_m(row: list[Joint]) -> float:
