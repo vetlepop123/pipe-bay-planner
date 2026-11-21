@@ -147,49 +147,85 @@ PIPE_SIZE_LABEL_BY_SIZE = {size: label for label, size in PIPE_SIZE_BY_LABEL.ite
 RISER_SIZE_LABEL = f'Riser {models.RISER_DIAMETER_IN:g}"'
 
 
-def _load_job_safely(name: str) -> models.Job | None:
-    try:
-        return storage.load_job(name)
-    except Exception as e:
-        st.warning(f"Couldn't load job '{name}' ({e}).")
-        return None
+def _open_job(job: models.Job | None) -> None:
+    """Switch to `job`, or back to the start screen if None."""
+    st.session_state.job = job
+    _select_joint(None)
 
 
-if "job" not in st.session_state:
-    existing = storage.list_jobs()
-    loaded = _load_job_safely(existing[0]) if existing else None
-    st.session_state.job = loaded or models.new_job("New Job", rigs.rig_names()[0])
+def _start_screen() -> None:
+    """Shown whenever no job is open, so nobody lands in (and edits) someone else's job by accident."""
+    st.title("Pipe Bay Planner")
+    st.write("Open a saved job, or start a new one.")
+    open_col, new_col = st.columns(2, gap="large")
+
+    with open_col, st.container(border=True):
+        st.subheader("Open a saved job")
+        jobs = storage.list_jobs()
+        if jobs:
+            name = st.selectbox("Job", jobs, index=None, placeholder="Choose a job…", key="start_open_name")
+            if st.button("Open job", type="primary", disabled=name is None) and name is not None:
+                try:
+                    _open_job(storage.load_job(name))
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Couldn't open '{name}': {e}")
+        else:
+            st.caption("No saved jobs yet.")
+
+    with new_col, st.container(border=True):
+        st.subheader("Create a new job")
+        new_name = st.text_input("Job name", key="start_new_name").strip()
+        new_rig = st.selectbox("Rig", rigs.rig_names(), key="start_new_rig")
+        if st.button("Create job", type="primary"):
+            if not new_name:
+                st.warning("Enter a name.")
+            elif new_name in storage.list_jobs():
+                st.warning("A job with that name already exists — open it instead, or pick another name.")
+            else:
+                _open_job(models.new_job(new_name, new_rig))
+                _save()
+                st.rerun()
+
+    with st.expander("Restore a job from a downloaded backup file"):
+        restore_file = st.file_uploader("Backup file", type="json", key="restore_upload")
+        if restore_file is not None:
+            try:
+                restored = models.job_from_dict(json.loads(restore_file.getvalue().decode("utf-8")))
+            except Exception as e:
+                st.error(f"Couldn't read that file: {e}")
+                return
+            exists = restored.name in storage.list_jobs()
+            if exists:
+                st.warning(f"A saved job named '{restored.name}' already exists. Restoring replaces it with the file.")
+            confirmed = st.checkbox(f"Replace the saved '{restored.name}'", key="restore_confirm") if exists else True
+            if st.button("Restore job", disabled=not confirmed):
+                try:
+                    storage.save_job(restored)
+                    _open_job(restored)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Couldn't save the restored job: {e}")
+
+
+if st.session_state.get("job") is None:
+    _start_screen()
+    st.stop()
 
 job = st.session_state.job
 
 st.sidebar.header("Job")
-existing_jobs = storage.list_jobs()
-job_options = existing_jobs if job.name in existing_jobs else [job.name] + existing_jobs
-selected = st.sidebar.selectbox("Current job", job_options, index=job_options.index(job.name))
-if selected != job.name:
-    loaded = _load_job_safely(selected)
-    if loaded is not None:
-        st.session_state.job = loaded
-        st.rerun()
-
-with st.sidebar.expander("New job"):
-    new_name = st.text_input("Job name", key="new_job_name")
-    new_rig = st.selectbox("Rig", rigs.rig_names(), key="new_job_rig")
-    if st.button("Create job"):
-        if not new_name.strip():
-            st.warning("Enter a name.")
-        elif new_name.strip() in storage.list_jobs():
-            st.warning("A job with that name already exists.")
-        else:
-            st.session_state.job = models.new_job(new_name.strip(), new_rig)
-            _save()
-            st.rerun()
+st.sidebar.markdown(f"**{job.name}**  \n{job.rig_name}")
+if st.sidebar.button("Close job", help="Back to the start screen, to open another job or create a new one."):
+    _open_job(None)
+    st.rerun()
 
 with st.sidebar.expander("Rename / delete job"):
-    rename = st.text_input("Rename to", value=job.name, key="rename_job")
+    # Keyed per job, so a name typed while another job was open isn't carried over.
+    rename = st.text_input("Rename to", value=job.name, key=f"rename_job_{job.name}")
     rcol1, rcol2 = st.columns(2)
     if rcol1.button("Rename"):
-        new_name = rename.strip()
+        new_name = (rename or "").strip()
         if new_name and new_name != job.name:
             try:
                 storage.rename_job(job, new_name)
@@ -199,30 +235,21 @@ with st.sidebar.expander("Rename / delete job"):
     if rcol2.button("Delete job"):
         try:
             storage.delete_job(job.name)
+            _open_job(None)
+            st.rerun()
         except Exception as e:
             st.warning(f"Couldn't delete '{job.name}': {e}")
-        st.session_state.job = models.new_job("New Job", rigs.rig_names()[0])
-        st.rerun()
 
-with st.sidebar.expander("Backup / restore"):
+with st.sidebar.expander("Backup"):
     backup_bytes = json.dumps(models.job_to_dict(job), indent=2).encode("utf-8")
     st.download_button(
         "Download this job as a file",
         backup_bytes,
         file_name=f"{job.name}.json",
         mime="application/json",
-        help="Save a copy of this job on your own computer, e.g. before big changes.",
+        help="Save a copy of this job on your own computer, e.g. before big changes. "
+        "Restore it from the start screen (Close job).",
     )
-    restore_file = st.file_uploader("Restore from a downloaded file", type="json", key="restore_upload")
-    if restore_file is not None:
-        try:
-            restored = models.job_from_dict(json.loads(restore_file.read().decode("utf-8")))
-            st.session_state.job = restored
-            storage.save_job(restored)
-            st.success(f"Restored '{restored.name}'.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Couldn't read that file: {e}")
 
 mergeable_names = {n for seq in rigs.mergeable_sequences(job.rig_name) for n in seq["bays"]}
 mergeable_candidates = [b.name for b in job.bays if b.name in mergeable_names]
@@ -272,7 +299,7 @@ with st.sidebar.expander("Add joint type"):
 if job.joint_types:
     with st.sidebar.expander("Remove joint type"):
         jt_to_remove = st.selectbox("Type", [t.name for t in job.joint_types], key="remove_jt_select")
-        if st.button("Remove joint type"):
+        if st.button("Remove joint type") and jt_to_remove is not None:
             models.remove_joint_type(job, jt_to_remove)
             _save()
             st.rerun()
@@ -615,7 +642,7 @@ else:
             lcol, dcol = st.columns(2)
             if lcol.button("Load snapshot"):
                 try:
-                    st.session_state.job = storage.load_snapshot(job.name, snap_to_load)
+                    _open_job(storage.load_snapshot(job.name, snap_to_load))
                     _save()
                     st.rerun()
                 except Exception as e:
