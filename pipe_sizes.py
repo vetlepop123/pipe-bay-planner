@@ -1,7 +1,14 @@
 """Named pipe sizes offered in the "add joints" dropdown, plus their defaults.
 
 Add/remove/correct sizes or colors here — there's no UI for editing this list.
+
+Every joint records its category as well as its diameter, because casing and drill pipe
+share some diameters (5 1/2", 5 7/8") but stack to different heights.
 """
+
+CASING = "Casing"
+DRILL_PIPE = "Drill pipe"
+RISER = "Riser"
 
 CASING_SIZES: list[tuple[str, float]] = [
     ('20"', 20.0),
@@ -28,9 +35,8 @@ DRILL_PIPE_SIZES: list[tuple[str, float]] = [
 
 # Drill pipe stacks on its tool joints (the thicker threaded ends), which sit taller than
 # the pipe body — so the diameter that matters for vertical stacking height is bigger than
-# the body OD used for horizontal spacing. Sizes not listed here (including all casing)
-# use the same diameter both ways.
-VERTICAL_SIZE_OVERRIDES: dict[float, float] = {
+# the body OD used for horizontal spacing. Casing and risers use the same diameter both ways.
+DRILL_PIPE_TOOL_JOINT_SIZES: dict[float, float] = {
     6.625: 8.0,
     5.875: 7.0,
     5.5: 7.0,
@@ -60,26 +66,25 @@ SIZE_COLORS: dict[float, str] = {
 }
 DEFAULT_FILL_COLOR = "#999999"
 
-_ALL_SIZES = CASING_SIZES + DRILL_PIPE_SIZES
-_LABEL_BY_DIAMETER: dict[float, str] = {}
-for _label, _d in _ALL_SIZES:
-    _LABEL_BY_DIAMETER.setdefault(_d, _label)
+_SIZES_BY_CATEGORY = {CASING: CASING_SIZES, DRILL_PIPE: DRILL_PIPE_SIZES}
 
 
-def options() -> list[tuple[str, float]]:
-    """(dropdown label, diameter in inches) pairs, grouped and labeled by category."""
-    return [(f"Casing {label}", d) for label, d in CASING_SIZES] + [
-        (f"Drill pipe {label}", d) for label, d in DRILL_PIPE_SIZES
-    ]
+def options() -> list[tuple[str, str, float]]:
+    """(dropdown label, category, diameter in inches) for every pipe size, casing first."""
+    return [(f"{category} {label}", category, d) for category, sizes in _SIZES_BY_CATEGORY.items() for label, d in sizes]
 
 
-def vertical_diameter_for(diameter_in: float) -> float:
-    return VERTICAL_SIZE_OVERRIDES.get(diameter_in, diameter_in)
+def vertical_diameter_for(category: str, diameter_in: float) -> float:
+    if category == DRILL_PIPE:
+        return DRILL_PIPE_TOOL_JOINT_SIZES.get(diameter_in, diameter_in)
+    return diameter_in
 
 
 def fill_color_for(diameter_in: float) -> str:
     return SIZE_COLORS.get(diameter_in, DEFAULT_FILL_COLOR)
 
 
-def label_for_diameter(diameter_in: float) -> str:
-    return _LABEL_BY_DIAMETER.get(diameter_in, f'{diameter_in:g}"')
+def size_label(category: str, diameter_in: float) -> str:
+    """Short size text, e.g. '9 5/8"' for casing and '5 1/2" DP' for drill pipe."""
+    label = next((lbl for lbl, d in _SIZES_BY_CATEGORY.get(category, []) if d == diameter_in), f'{diameter_in:g}"')
+    return f"{label} DP" if category == DRILL_PIPE else label

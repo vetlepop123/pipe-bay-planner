@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import base64
-import io
 import json
 
 import streamlit as st
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 import models
 import pipe_sizes
@@ -45,17 +44,107 @@ if not _check_password():
     st.stop()
 
 
+def _database_url() -> str | None:
+    # Set database_url in Streamlit Cloud's Secrets to a hosted Postgres database, e.g.
+    #   database_url = "postgresql://user:password@host:5432/postgres"
+    # Without it, jobs go to a local SQLite file (fine locally, wiped on Streamlit Cloud).
+    try:
+        return st.secrets.get("database_url")
+    except Exception:
+        return None
+
+
+try:
+    storage.connect(_database_url())
+except Exception as e:
+    st.error(f"Couldn't connect to the database: {e}")
+    st.stop()
+
+
 def _save() -> None:
     try:
         storage.save_job(st.session_state.job)
     except Exception as e:
-        st.warning(f"Your change applied, but saving to disk failed: {e}")
+        st.warning(f"Your change applied, but saving it to the database failed: {e}")
+
+
+# Bay settings widgets mirror the model: their state is reset from the bay every run, and
+# changes go through these callbacks, so a refused change snaps the widget back and a
+# loaded job/snapshot always shows its own settings.
+def _flash(message: str) -> None:
+    st.session_state.setdefault("flash", []).append(message)
+
+
+def _on_riser_stacking_change(bay_name: str, key: str) -> None:
+    bay = st.session_state.job.get_bay(bay_name)
+    if bay is None:
+        return
+    try:
+        models.set_riser_stacking(bay, st.session_state[key])
+        _save()
+    except ValueError as e:
+        _flash(str(e))
+
+
+def _on_numbering_change(bay_name: str, direction_key: str, start_key: str, grouping_key: str) -> None:
+    bay = st.session_state.job.get_bay(bay_name)
+    if bay is None:
+        return
+    try:
+        models.set_numbering(
+            bay, st.session_state[direction_key], int(st.session_state[start_key]), st.session_state[grouping_key]
+        )
+        _save()
+    except ValueError as e:
+        _flash(str(e))
+
+
+def _on_group_start_change(bay_name: str, group: tuple[str, str, float], key: str) -> None:
+    bay = st.session_state.job.get_bay(bay_name)
+    if bay is None:
+        return
+    try:
+        models.set_group_start(bay, *group, int(st.session_state[key]))
+        _save()
+    except ValueError as e:
+        _flash(str(e))
+
+
+def _select_joint(selection: tuple[str, int] | None) -> None:
+    st.session_state.selected_joint = selection
+    # Fresh widget keys per selection, so the edit form never shows a previous joint's values.
+    st.session_state.edit_nonce = st.session_state.get("edit_nonce", 0) + 1
+
+
+# Streamlit reruns this whole script on every click, so drawing is cached on the job's
+# contents (as JSON) and only redone when something that's drawn actually changes.
+@st.cache_data(max_entries=20, show_spinner=False)
+def _cached_view(job_json: str, zoom: float, bays: tuple[str, ...], selected: tuple[str, int] | None) -> render.View:
+    return render.render_view(models.job_from_dict(json.loads(job_json)), zoom, list(bays), selected)
+
+
+@st.cache_data(max_entries=10, show_spinner="Preparing download…")
+def _cached_export(job_json: str, bays: tuple[str, ...], fmt: str) -> bytes:
+    return render.export_bytes(models.job_from_dict(json.loads(job_json)), list(bays), fmt)
+
+
+class _EncodedPng:
+    """Hands already-encoded PNG bytes to streamlit_image_coordinates, which otherwise
+    wants an image object and would decode and re-compress the whole picture every run."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def save(self, fp, **_) -> None:
+        fp.write(self.data)
 
 
 # ---------------------------------------------------------------- job setup
 PIPE_SIZE_OPTIONS = pipe_sizes.options()
-PIPE_SIZE_LABELS = [label for label, _ in PIPE_SIZE_OPTIONS]
-PIPE_SIZE_BY_LABEL = dict(PIPE_SIZE_OPTIONS)
+PIPE_SIZE_LABELS = [label for label, _, _ in PIPE_SIZE_OPTIONS]
+PIPE_SIZE_BY_LABEL = {label: (category, d) for label, category, d in PIPE_SIZE_OPTIONS}
+PIPE_SIZE_LABEL_BY_SIZE = {size: label for label, size in PIPE_SIZE_BY_LABEL.items()}
+RISER_SIZE_LABEL = f'Riser {models.RISER_DIAMETER_IN:g}"'
 
 
 def _load_job_safely(name: str) -> models.Job | None:
@@ -102,14 +191,11 @@ with st.sidebar.expander("Rename / delete job"):
     if rcol1.button("Rename"):
         new_name = rename.strip()
         if new_name and new_name != job.name:
-            old_name = job.name
-            job.name = new_name
-            _save()
             try:
-                storage.delete_job(old_name)
+                storage.rename_job(job, new_name)
+                st.rerun()
             except Exception as e:
-                st.warning(f"Renamed, but couldn't remove the old file '{old_name}': {e}")
-            st.rerun()
+                st.warning(f"Couldn't rename: {e}")
     if rcol2.button("Delete job"):
         try:
             storage.delete_job(job.name)
@@ -125,7 +211,7 @@ with st.sidebar.expander("Backup / restore"):
         backup_bytes,
         file_name=f"{job.name}.json",
         mime="application/json",
-        help="Save a local copy — especially important on a hosted deployment, where storage isn't guaranteed to persist.",
+        help="Save a copy of this job on your own computer, e.g. before big changes.",
     )
     restore_file = st.file_uploader("Restore from a downloaded file", type="json", key="restore_upload")
     if restore_file is not None:
@@ -138,10 +224,7 @@ with st.sidebar.expander("Backup / restore"):
         except Exception as e:
             st.error(f"Couldn't read that file: {e}")
 
-try:
-    mergeable_names = {n for seq in rigs.mergeable_sequences(job.rig_name) for n in seq["bays"]}
-except ValueError:
-    mergeable_names = set()  # job's rig no longer exists in rigs.py — nothing to offer merging on
+mergeable_names = {n for seq in rigs.mergeable_sequences(job.rig_name) for n in seq["bays"]}
 mergeable_candidates = [b.name for b in job.bays if b.name in mergeable_names]
 if mergeable_candidates or job.merge_groups:
     with st.sidebar.expander("Merge pipe bays"):
@@ -197,6 +280,8 @@ if job.joint_types:
 # ---------------------------------------------------------------- main area
 st.title(job.name)
 st.caption(f"Rig: {job.rig_name}")
+for flash_message in st.session_state.pop("flash", []):
+    st.warning(flash_message)
 
 if not job.bays:
     st.info("This job's rig has no bays configured — edit rigs.py to add some.")
@@ -209,15 +294,26 @@ else:
         st.error(f"Bay '{selected_bay_name}' not found.")
         st.stop()
 
-    type_options = [t.name for t in job.joint_types]
+    category = st.radio("Adding", ["Pipe / casing", "Riser"], horizontal=True, key="add_category")
+    adding_risers = category == "Riser"
+    if adding_risers and bay.joints and not bay.holds_risers():
+        st.caption(f"⚠ '{bay.name}' has pipe/casing in it — risers need a bay with nothing else in it.")
+    elif not adding_risers and bay.holds_risers():
+        st.caption(f"⚠ '{bay.name}' holds risers — no pipe or casing can go in the same bay.")
+
+    type_options = list(models.RISER_TYPES) if adding_risers else [t.name for t in job.joint_types]
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        sel_type = st.selectbox("Type", type_options, key="add_type") if type_options else None
+        sel_type = st.selectbox("Type", type_options, key=f"add_type_{category}") if type_options else None
         if not type_options:
             st.caption("Define a joint type in the sidebar first.")
     with c2:
-        add_size_label = st.selectbox("Pipe size", PIPE_SIZE_LABELS, key="add_size")
-        add_diameter = PIPE_SIZE_BY_LABEL[add_size_label]
+        if adding_risers:
+            st.selectbox("Pipe size", [RISER_SIZE_LABEL], disabled=True, key="add_size_riser")
+            add_category, add_diameter = pipe_sizes.RISER, models.RISER_DIAMETER_IN
+        else:
+            add_size_label = st.selectbox("Pipe size", PIPE_SIZE_LABELS, key="add_size")
+            add_category, add_diameter = PIPE_SIZE_BY_LABEL[add_size_label]
     with c3:
         add_count = st.number_input("Count", min_value=1, value=1, step=1, key="add_count")
     with c4:
@@ -250,6 +346,22 @@ else:
                 _save()
                 st.rerun()
 
+    if adding_risers or bay.holds_risers():
+        stacking_key = f"riser_stacking_{bay.name}"
+        st.session_state[stacking_key] = bay.riser_stacking
+        st.radio(
+            "Riser stacking",
+            list(models.RISER_STACKING_MODES),
+            format_func=models.RISER_STACKING_MODES.__getitem__,
+            horizontal=True,
+            key=stacking_key,
+            on_change=_on_riser_stacking_change,
+            args=(bay.name, stacking_key),
+            help="Nested: each layer sits in the grooves of the one below, every other layer shifted half a "
+            "riser over (one riser fewer if the bay isn't wide enough for the shift). "
+            "Perfect: risers stacked straight on top of each other. No dunnage is used either way.",
+        )
+
     ac1, ac2, ac3 = st.columns(3)
     with ac1:
         if st.button("Add joints", disabled=not type_options):
@@ -259,14 +371,16 @@ else:
                 try:
                     if max_per_layer > 0:
                         models.set_row_capacity_override(bay, add_diameter, int(max_per_layer))
-                    models.add_joints(bay, sel_type, int(add_count), float(add_diameter), add_label.strip() or None)
+                    models.add_joints(
+                        bay, sel_type, int(add_count), add_category, float(add_diameter), add_label.strip() or None
+                    )
                     _save()
                     st.rerun()
                 except ValueError as e:
                     st.warning(str(e))
     with ac2:
         remove_count = st.number_input("Remove count", min_value=1, value=1, step=1, key="remove_count")
-        if st.button("Remove joints"):
+        if st.button("Remove from top", help="Removes the last joints stacked, top of the pile first."):
             try:
                 models.remove_joints(bay, int(remove_count))
                 _save()
@@ -292,6 +406,71 @@ else:
             f"{models.PREFERRED_MAX_STACK_HEIGHT_M:g} m height — only go this high if space requires it."
         )
 
+    with st.expander(f"Numbering in {bay.name}"):
+        direction_key = f"number_direction_{bay.name}"
+        start_key = f"number_start_{bay.name}"
+        grouping_key = f"number_grouping_{bay.name}"
+        st.session_state[direction_key] = bay.number_direction
+        st.session_state[start_key] = bay.number_start
+        st.session_state[grouping_key] = bay.number_grouping
+        numbering_args = (bay.name, direction_key, start_key, grouping_key)
+        nc1, nc2, nc3 = st.columns(3)
+        nc1.selectbox(
+            "Count",
+            list(models.NUMBERING_GROUPINGS),
+            format_func=models.NUMBERING_GROUPINGS.__getitem__,
+            key=grouping_key,
+            on_change=_on_numbering_change,
+            args=numbering_args,
+            help="Separately: every type + size starts its own count (Slick 9 5/8\" 1, 2, 3… and Shoetrack 1, 2…). "
+            "Together: one count through the whole bay, whatever the type.",
+        )
+        nc2.selectbox(
+            "Direction",
+            list(models.NUMBERING_DIRECTIONS),
+            format_func=models.NUMBERING_DIRECTIONS.__getitem__,
+            key=direction_key,
+            on_change=_on_numbering_change,
+            args=numbering_args,
+            help="The order joints are counted in through the current stack.",
+        )
+        nc3.number_input(
+            "Start at",
+            min_value=1,
+            step=1,
+            key=start_key,
+            on_change=_on_numbering_change,
+            args=numbering_args,
+            help="e.g. to continue the count from another bay. "
+            "When counting separately, this is where every type + size starts unless given its own start below.",
+        )
+        groups = models.number_groups(bay)
+        if bay.number_grouping == "per_type" and groups:
+            st.markdown("**Start number per type + size**")
+            group_cols = st.columns(min(len(groups), 4))
+            for i, group in enumerate(groups):
+                type_name, group_category, diameter = group
+                gkey = f"group_start_{bay.name}_{models.group_key(*group)}"
+                st.session_state[gkey] = models.group_start(bay, *group)
+                group_cols[i % len(group_cols)].number_input(
+                    f"{type_name} {pipe_sizes.size_label(group_category, diameter)}",
+                    min_value=1,
+                    step=1,
+                    key=gkey,
+                    on_change=_on_group_start_change,
+                    args=(bay.name, group, gkey),
+                )
+            st.caption(f"Set a group back to {bay.number_start} to make it follow \"Start at\" again.")
+        manual_count = sum(1 for j in bay.joints if j.manual_number is not None)
+        st.caption(
+            "To give a single joint its own number, click it in the deck plan below. "
+            "The other joints in the same count skip over that number."
+        )
+        if manual_count and st.button(f"Clear {manual_count} manual number(s)"):
+            models.clear_manual_numbers(bay)
+            _save()
+            st.rerun()
+
     st.subheader("Deck plan")
     dc1, dc2 = st.columns(2)
     with dc1:
@@ -309,28 +488,111 @@ else:
             "(scroll sideways to pan when zoomed in).",
         )
 
-    fig = render.build_figure(job, zoom=zoom_pct / 100, only_bays=display_bay_names)
-    view_buf = io.BytesIO()
-    fig.savefig(view_buf, format="png", bbox_inches="tight", dpi=150)
-    view_b64 = base64.b64encode(view_buf.getvalue()).decode()
-    st.markdown(
-        f'<div style="width:100%; overflow-x:auto; border:1px solid #ddd; border-radius:4px; padding:6px;">'
-        f'<img src="data:image/png;base64,{view_b64}" '
-        f'style="display:block; max-width:none; width:auto; height:auto;">'
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    selected = st.session_state.get("selected_joint")
+    if selected is not None:
+        sel_bay = job.get_bay(selected[0])
+        if sel_bay is None or sel_bay.get_joint(selected[1]) is None or selected[0] not in display_bay_names:
+            _select_joint(None)  # deleted, cleared, merged away or hidden since it was clicked
+            selected = None
 
-    export_fig = fig if zoom_pct == 100 else render.build_figure(job, only_bays=display_bay_names)
-    png_buf = io.BytesIO()
-    export_fig.savefig(png_buf, format="png", bbox_inches="tight", dpi=200)
-    pdf_buf = io.BytesIO()
-    export_fig.savefig(pdf_buf, format="pdf", bbox_inches="tight")
+    job_json = json.dumps(models.job_to_dict(job), sort_keys=True)
+    view = _cached_view(job_json, zoom_pct / 100, tuple(display_bay_names), selected)
+    st.caption("Click a joint to change or delete it.")
+    click = streamlit_image_coordinates(_EncodedPng(view.png), key="deck_plan_click", cursor="pointer")
+    # The component keeps returning its last click on every rerun, so only act on a new one.
+    if click and click.get("unix_time") != st.session_state.get("last_click_time"):
+        st.session_state.last_click_time = click.get("unix_time")
+        scale = view.width / click["width"] if click.get("width") else 1.0
+        hit = view.joint_at(click["x"] * scale, click["y"] * scale)
+        clicked = (hit.bay_name, hit.order) if hit else None
+        if clicked != selected:
+            _select_joint(clicked)
+            st.rerun()
 
+    if selected is not None:
+        sel_bay = job.get_bay(selected[0])
+        joint = sel_bay.get_joint(selected[1]) if sel_bay else None
+        if sel_bay is not None and joint is not None:
+            nonce = st.session_state.get("edit_nonce", 0)
+            number = models.display_numbers(sel_bay)[joint.order]
+            riser = models.is_riser(joint)
+            with st.container(border=True):
+                st.markdown(
+                    f"**Selected:** {sel_bay.name} — {joint.type_name} "
+                    f"{pipe_sizes.size_label(joint.category, joint.diameter_in)} #{number}"
+                    + (f' (labelled "{joint.label}")' if joint.label else "")
+                )
+                edit_types = list(models.RISER_TYPES) if riser else [t.name for t in job.joint_types]
+                if joint.type_name not in edit_types:
+                    edit_types.insert(0, joint.type_name)  # its type was since removed from the legend
+                e1, e2, e3, e4 = st.columns(4)
+                new_type = e1.selectbox(
+                    "Type", edit_types, index=edit_types.index(joint.type_name), key=f"edit_type_{nonce}"
+                )
+                if riser:
+                    e2.selectbox("Pipe size", [RISER_SIZE_LABEL], disabled=True, key=f"edit_size_{nonce}")
+                    new_category, new_diameter = joint.size_key
+                else:
+                    new_size = e2.selectbox(
+                        "Pipe size",
+                        PIPE_SIZE_LABELS,
+                        index=PIPE_SIZE_LABELS.index(PIPE_SIZE_LABEL_BY_SIZE[joint.size_key]),
+                        key=f"edit_size_{nonce}",
+                    )
+                    new_category, new_diameter = PIPE_SIZE_BY_LABEL[new_size]
+                new_label = e3.text_input("Label (optional)", value=joint.label or "", key=f"edit_label_{nonce}")
+                new_number = e4.number_input(
+                    "Number (0 = automatic)",
+                    min_value=0,
+                    value=joint.manual_number or 0,
+                    step=1,
+                    key=f"edit_number_{nonce}",
+                    help="Pin this joint's number. The other joints in the same count skip over it.",
+                )
+                b1, b2, b3 = st.columns(3)
+                if b1.button("Save changes", type="primary"):
+                    try:
+                        models.update_joint(
+                            sel_bay,
+                            joint.order,
+                            new_type,
+                            new_category,
+                            float(new_diameter),
+                            new_label.strip() or None,
+                            int(new_number) or None,
+                        )
+                        _save()
+                        st.rerun()
+                    except ValueError as e:
+                        st.warning(str(e))
+                if b2.button("Delete joint"):
+                    try:
+                        models.delete_joint(sel_bay, joint.order)
+                        _select_joint(None)
+                        _save()
+                        st.rerun()
+                    except ValueError as e:
+                        st.warning(str(e))
+                if b3.button("Deselect"):
+                    _select_joint(None)
+                    st.rerun()
+
+    # Exports are only drawn when a download button is actually clicked.
+    export_bays = tuple(display_bay_names)
     dl1, dl2 = st.columns(2)
-    dl1.download_button("Download PNG", png_buf.getvalue(), file_name=f"{job.name}.png", mime="image/png")
+    dl1.download_button(
+        "Download PNG",
+        lambda: _cached_export(job_json, export_bays, "png"),
+        file_name=f"{job.name}.png",
+        mime="image/png",
+        on_click="ignore",
+    )
     dl2.download_button(
-        "Download PDF", pdf_buf.getvalue(), file_name=f"{job.name}.pdf", mime="application/pdf"
+        "Download PDF",
+        lambda: _cached_export(job_json, export_bays, "pdf"),
+        file_name=f"{job.name}.pdf",
+        mime="application/pdf",
+        on_click="ignore",
     )
 
     st.subheader("Snapshots")
