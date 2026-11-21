@@ -8,6 +8,7 @@ database instead by setting the `database_url` secret — see pipebay._database_
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -44,8 +45,11 @@ def connect(url: str | None) -> None:
     """
     global _engine, _engine_url
     url = url or LOCAL_DATABASE_URL
-    if url.startswith("postgres://"):  # some providers hand out this older spelling
-        url = "postgresql://" + url[len("postgres://") :]
+    # Providers hand out plain postgres:// or postgresql:// URLs; pin the driver to psycopg (v3,
+    # see requirements.txt) rather than whatever the installed SQLAlchemy defaults to.
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            url = "postgresql+psycopg://" + url[len(prefix) :]
     if _engine is not None and url == _engine_url:
         return
     if url.startswith("sqlite:///"):
@@ -53,12 +57,35 @@ def connect(url: str | None) -> None:
     engine = sa.create_engine(url, pool_pre_ping=True)
     _metadata.create_all(engine)
     _engine, _engine_url = engine, url
+    _forget_lists()
 
 
 def _db() -> sa.Engine:
     if _engine is None:
         raise RuntimeError("storage.connect() hasn't been called.")
     return _engine
+
+
+# The sidebar asks for the job and snapshot lists on every Streamlit rerun (every click), and
+# a hosted database is a network round trip away, so the lists are kept in memory. Writes made
+# through this module update or drop them right away; writes from anywhere else (another copy
+# of the app on the same database) show up once the lists are older than LIST_CACHE_SECONDS.
+LIST_CACHE_SECONDS = 60
+_list_cache: dict[str, tuple[float, list[str]]] = {}  # "jobs" or "snapshots:<job>" -> (fetched at, names)
+
+
+def _cached_list(key: str, query: sa.Select) -> list[str]:
+    hit = _list_cache.get(key)
+    if hit is not None and time.monotonic() - hit[0] < LIST_CACHE_SECONDS:
+        return list(hit[1])
+    with _db().connect() as conn:
+        names = list(conn.execute(query).scalars())
+    _list_cache[key] = (time.monotonic(), names)
+    return list(names)
+
+
+def _forget_lists() -> None:
+    _list_cache.clear()
 
 
 def _dumps(job: Job) -> str:
@@ -72,13 +99,15 @@ def _upsert(conn: sa.Connection, table: sa.Table, key: dict, data: str) -> None:
 
 
 def list_jobs() -> list[str]:
-    with _db().connect() as conn:
-        return list(conn.execute(sa.select(_jobs.c.name).order_by(_jobs.c.name)).scalars())
+    return _cached_list("jobs", sa.select(_jobs.c.name).order_by(_jobs.c.name))
 
 
 def save_job(job: Job) -> None:
     with _db().begin() as conn:
         _upsert(conn, _jobs, {"name": job.name}, _dumps(job))
+    cached = _list_cache.get("jobs")
+    if cached is not None and job.name not in cached[1]:
+        _forget_lists()  # a new job — the common case (an edit to a listed job) keeps the cache
 
 
 def load_job(name: str) -> Job:
@@ -96,6 +125,7 @@ def rename_job(job: Job, new_name: str) -> None:
         conn.execute(sa.delete(_jobs).where(_jobs.c.name == job.name))
         conn.execute(sa.insert(_jobs).values(name=new_name, data=data))
         conn.execute(sa.update(_snapshots).where(_snapshots.c.job_name == job.name).values(job_name=new_name))
+    _forget_lists()
     job.name = new_name  # only once the database has it
 
 
@@ -103,17 +133,18 @@ def delete_job(name: str) -> None:
     with _db().begin() as conn:
         conn.execute(sa.delete(_jobs).where(_jobs.c.name == name))
         conn.execute(sa.delete(_snapshots).where(_snapshots.c.job_name == name))
+    _forget_lists()
 
 
 def save_snapshot(job: Job, label: str) -> None:
     with _db().begin() as conn:
         _upsert(conn, _snapshots, {"job_name": job.name, "label": label}, _dumps(job))
+    _forget_lists()
 
 
 def list_snapshots(job_name: str) -> list[str]:
-    with _db().connect() as conn:
-        query = sa.select(_snapshots.c.label).where(_snapshots.c.job_name == job_name).order_by(_snapshots.c.label)
-        return list(conn.execute(query).scalars())
+    query = sa.select(_snapshots.c.label).where(_snapshots.c.job_name == job_name).order_by(_snapshots.c.label)
+    return _cached_list(f"snapshots:{job_name}", query)
 
 
 def load_snapshot(job_name: str, label: str) -> Job:
@@ -128,3 +159,4 @@ def load_snapshot(job_name: str, label: str) -> Job:
 def delete_snapshot(job_name: str, label: str) -> None:
     with _db().begin() as conn:
         conn.execute(sa.delete(_snapshots).where(_snapshots.c.job_name == job_name, _snapshots.c.label == label))
+    _forget_lists()

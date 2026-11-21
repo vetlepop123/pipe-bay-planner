@@ -2,4 +2,4 @@ streamlit
 matplotlib
 streamlit-image-coordinates
 sqlalchemy
-psycopg2-binary
+psycopg[binary]
