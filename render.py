@@ -10,7 +10,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
+# Figures are built with Figure() directly, never pyplot: pyplot keeps global state that leaks
+# memory and isn't safe with several Streamlit sessions rendering at once.
 import matplotlib.patheffects as pe
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.collections import PatchCollection
@@ -148,7 +149,7 @@ def build_plan(
     bays = [b for b in job.bays if only_bays is None or b.name in only_bays] if job.bays else []
 
     if not bays:
-        fig = plt.figure(figsize=(6, 2))
+        fig = Figure(figsize=(6, 2))
         msg = "This rig has no bays defined in rigs.py." if not job.bays else "No bays selected to display."
         fig.text(0.5, 0.5, msg, ha="center", va="center", fontsize=12)
         return fig, []

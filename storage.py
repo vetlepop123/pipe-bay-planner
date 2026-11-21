@@ -102,31 +102,69 @@ def list_jobs() -> list[str]:
     return _cached_list("jobs", sa.select(_jobs.c.name).order_by(_jobs.c.name))
 
 
-def save_job(job: Job) -> None:
+# Several people can have the same job open. To stop one of them silently overwriting the
+# other's work, every load/save hands back a version token (the exact stored JSON), and a
+# save only goes through if the database still holds the version that session last saw.
+class JobConflict(Exception):
+    """The job was changed, renamed or deleted by someone else since this session last loaded or saved it."""
+
+
+def _conflict(conn: sa.Connection, name: str) -> JobConflict:
+    if conn.execute(sa.select(_jobs.c.name).where(_jobs.c.name == name)).first() is None:
+        return JobConflict(f"'{name}' has been renamed or deleted by someone else.")
+    return JobConflict(f"Someone else has saved changes to '{name}' since you opened it.")
+
+
+def create_job(job: Job) -> str:
+    """Save a brand-new job; returns its version token. Refuses to replace an existing job."""
+    data = _dumps(job)
     with _db().begin() as conn:
-        _upsert(conn, _jobs, {"name": job.name}, _dumps(job))
-    cached = _list_cache.get("jobs")
-    if cached is not None and job.name not in cached[1]:
-        _forget_lists()  # a new job — the common case (an edit to a listed job) keeps the cache
+        if conn.execute(sa.select(_jobs.c.name).where(_jobs.c.name == job.name)).first():
+            raise ValueError(f"A job named '{job.name}' already exists.")
+        conn.execute(sa.insert(_jobs).values(name=job.name, data=data))
+    _forget_lists()
+    return data
 
 
-def load_job(name: str) -> Job:
+def save_job(job: Job, expected: str | None) -> str:
+    """Save `job` over the version `expected` (a token from load/create/save); returns the new token.
+
+    Raises JobConflict if the stored job is no longer `expected`. With expected=None the job
+    is written regardless (restoring a backup, or deliberately overwriting someone's changes).
+    """
+    data = _dumps(job)
+    with _db().begin() as conn:
+        update = sa.update(_jobs).where(_jobs.c.name == job.name)
+        if expected is not None:
+            update = update.where(_jobs.c.data == expected)
+        if conn.execute(update.values(data=data)).rowcount == 0:
+            if expected is not None:
+                raise _conflict(conn, job.name)
+            conn.execute(sa.insert(_jobs).values(name=job.name, data=data))
+            _forget_lists()
+    return data
+
+
+def load_job(name: str) -> tuple[Job, str]:
+    """The job and its version token."""
     with _db().connect() as conn:
         data = conn.execute(sa.select(_jobs.c.data).where(_jobs.c.name == name)).scalar_one()
-    return job_from_dict(json.loads(data))
+    return job_from_dict(json.loads(data)), data
 
 
-def rename_job(job: Job, new_name: str) -> None:
-    """Rename a job in place, carrying its snapshots over to the new name."""
+def rename_job(job: Job, new_name: str, expected: str) -> str:
+    """Rename a job in place, carrying its snapshots over to the new name; returns the new token."""
+    data = json.dumps({**job_to_dict(job), "name": new_name})
     with _db().begin() as conn:
         if conn.execute(sa.select(_jobs.c.name).where(_jobs.c.name == new_name)).first():
             raise ValueError(f"A job named '{new_name}' already exists.")
-        data = json.dumps({**job_to_dict(job), "name": new_name})
-        conn.execute(sa.delete(_jobs).where(_jobs.c.name == job.name))
+        if conn.execute(sa.delete(_jobs).where(_jobs.c.name == job.name, _jobs.c.data == expected)).rowcount == 0:
+            raise _conflict(conn, job.name)
         conn.execute(sa.insert(_jobs).values(name=new_name, data=data))
         conn.execute(sa.update(_snapshots).where(_snapshots.c.job_name == job.name).values(job_name=new_name))
     _forget_lists()
     job.name = new_name  # only once the database has it
+    return data
 
 
 def delete_job(name: str) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 
 import streamlit as st
@@ -32,7 +33,7 @@ def _check_password() -> bool:
     st.title("Pipe Bay Planner")
     pw = st.text_input("Password", type="password", key="login_password")
     if st.button("Log in"):
-        if pw == required:
+        if hmac.compare_digest(pw.encode(), str(required).encode()):  # constant-time compare
             st.session_state.authenticated = True
             st.rerun()
         else:
@@ -62,8 +63,11 @@ except Exception as e:
 
 
 def _save() -> None:
+    """Save the open job over the version this session last loaded/saved (see storage.JobConflict)."""
     try:
-        storage.save_job(st.session_state.job)
+        st.session_state.job_saved = storage.save_job(st.session_state.job, st.session_state.job_saved)
+    except storage.JobConflict as e:
+        st.session_state.save_conflict = str(e)  # shown as a banner with the ways out
     except Exception as e:
         st.warning(f"Your change applied, but saving it to the database failed: {e}")
 
@@ -147,9 +151,11 @@ PIPE_SIZE_LABEL_BY_SIZE = {size: label for label, size in PIPE_SIZE_BY_LABEL.ite
 RISER_SIZE_LABEL = f'Riser {models.RISER_DIAMETER_IN:g}"'
 
 
-def _open_job(job: models.Job | None) -> None:
-    """Switch to `job`, or back to the start screen if None."""
+def _open_job(job: models.Job | None, saved: str | None = None) -> None:
+    """Switch to `job` (with its storage version token), or back to the start screen if None."""
     st.session_state.job = job
+    st.session_state.job_saved = saved
+    st.session_state.save_conflict = None
     _select_joint(None)
 
 
@@ -166,7 +172,7 @@ def _start_screen() -> None:
             name = st.selectbox("Job", jobs, index=None, placeholder="Choose a job…", key="start_open_name")
             if st.button("Open job", type="primary", disabled=name is None) and name is not None:
                 try:
-                    _open_job(storage.load_job(name))
+                    _open_job(*storage.load_job(name))
                     st.rerun()
                 except Exception as e:
                     st.error(f"Couldn't open '{name}': {e}")
@@ -180,12 +186,15 @@ def _start_screen() -> None:
         if st.button("Create job", type="primary"):
             if not new_name:
                 st.warning("Enter a name.")
-            elif new_name in storage.list_jobs():
-                st.warning("A job with that name already exists — open it instead, or pick another name.")
             else:
-                _open_job(models.new_job(new_name, new_rig))
-                _save()
-                st.rerun()
+                new_job = models.new_job(new_name, new_rig)
+                try:
+                    _open_job(new_job, storage.create_job(new_job))
+                    st.rerun()
+                except ValueError:
+                    st.warning("A job with that name already exists — open it instead, or pick another name.")
+                except Exception as e:
+                    st.error(f"Couldn't create the job: {e}")
 
     with st.expander("Restore a job from a downloaded backup file"):
         restore_file = st.file_uploader("Backup file", type="json", key="restore_upload")
@@ -201,8 +210,7 @@ def _start_screen() -> None:
             confirmed = st.checkbox(f"Replace the saved '{restored.name}'", key="restore_confirm") if exists else True
             if st.button("Restore job", disabled=not confirmed):
                 try:
-                    storage.save_job(restored)
-                    _open_job(restored)
+                    _open_job(restored, storage.save_job(restored, expected=None))
                     st.rerun()
                 except Exception as e:
                     st.error(f"Couldn't save the restored job: {e}")
@@ -223,22 +231,26 @@ if st.sidebar.button("Close job", help="Back to the start screen, to open anothe
 with st.sidebar.expander("Rename / delete job"):
     # Keyed per job, so a name typed while another job was open isn't carried over.
     rename = st.text_input("Rename to", value=job.name, key=f"rename_job_{job.name}")
-    rcol1, rcol2 = st.columns(2)
-    if rcol1.button("Rename"):
+    if st.button("Rename"):
         new_name = (rename or "").strip()
         if new_name and new_name != job.name:
             try:
-                storage.rename_job(job, new_name)
+                st.session_state.job_saved = storage.rename_job(job, new_name, st.session_state.job_saved)
+                st.rerun()
+            except storage.JobConflict as e:
+                st.session_state.save_conflict = str(e)
                 st.rerun()
             except Exception as e:
                 st.warning(f"Couldn't rename: {e}")
-    if rcol2.button("Delete job"):
-        try:
-            storage.delete_job(job.name)
-            _open_job(None)
-            st.rerun()
-        except Exception as e:
-            st.warning(f"Couldn't delete '{job.name}': {e}")
+    with st.popover("Delete job…"):
+        st.write(f"Permanently delete **{job.name}** and all its snapshots, for everyone? This can't be undone.")
+        if st.button("Yes, delete it", type="primary"):
+            try:
+                storage.delete_job(job.name)
+                _open_job(None)
+                st.rerun()
+            except Exception as e:
+                st.warning(f"Couldn't delete '{job.name}': {e}")
 
 with st.sidebar.expander("Backup"):
     backup_bytes = json.dumps(models.job_to_dict(job), indent=2).encode("utf-8")
@@ -310,6 +322,23 @@ st.caption(f"Rig: {job.rig_name}")
 for flash_message in st.session_state.pop("flash", []):
     st.warning(flash_message)
 
+if st.session_state.get("save_conflict"):
+    with st.container(border=True):
+        st.error(f"{st.session_state.save_conflict} Your changes since then are **not saved**.")
+        kc1, kc2 = st.columns(2)
+        if kc1.button("Load the saved version (drop my changes)"):
+            try:
+                _open_job(*storage.load_job(job.name))
+            except Exception:
+                _open_job(None)  # renamed or deleted — back to the start screen to pick it again
+            st.rerun()
+        if kc2.button("Keep my version (overwrite theirs)"):
+            try:
+                _open_job(job, storage.save_job(job, expected=None))
+                st.rerun()
+            except Exception as e:
+                st.warning(f"Couldn't save: {e}")
+
 if not job.bays:
     st.info("This job's rig has no bays configured — edit rigs.py to add some.")
 else:
@@ -362,16 +391,20 @@ else:
             # silently carrying a leftover override value onto a bay/size it was never meant for.
             key=f"max_per_layer_{bay.name}_{add_diameter}",
             help=f"Currently {current_effective} per layer in '{bay.name}' ({source}). "
-            "Leave at 0 to keep that; set a number to override it for this size in this bay going forward.",
+            "Leave at 0 to keep that; set a number to use it for every layer of this size in this bay "
+            "(applied when you click Add joints).",
         )
     with mc2:
         st.write("")
         st.write("")
         if current_override is not None:
             if st.button("Reset to automatic"):
-                models.clear_row_capacity_override(bay, add_diameter)
-                _save()
-                st.rerun()
+                try:
+                    models.clear_row_capacity_override(bay, add_diameter)
+                    _save()
+                    st.rerun()
+                except ValueError as e:
+                    st.warning(str(e))
 
     if adding_risers or bay.holds_risers():
         stacking_key = f"riser_stacking_{bay.name}"
@@ -396,10 +429,14 @@ else:
                 st.warning("Define a joint type first.")
             else:
                 try:
-                    if max_per_layer > 0:
-                        models.set_row_capacity_override(bay, add_diameter, int(max_per_layer))
                     models.add_joints(
-                        bay, sel_type, int(add_count), add_category, float(add_diameter), add_label.strip() or None
+                        bay,
+                        sel_type,
+                        int(add_count),
+                        add_category,
+                        float(add_diameter),
+                        add_label.strip() or None,
+                        max_per_layer=int(max_per_layer) or None,
                     )
                     _save()
                     st.rerun()
@@ -417,10 +454,12 @@ else:
     with ac3:
         st.write("")
         st.write("")
-        if st.button("Clear bay"):
-            models.clear_bay(bay)
-            _save()
-            st.rerun()
+        with st.popover("Clear bay…", disabled=not bay.joints):
+            st.write(f"Remove all {bay.count()} joints from **{bay.name}**?")
+            if st.button("Yes, clear it", type="primary"):
+                models.clear_bay(bay)
+                _save()
+                st.rerun()
 
     used_height = models.stack_height_m(models.row_layout(bay))
     st.caption(f"{bay.name}: {bay.count()} joints · {used_height:.2f}/{bay.height_m:g} m used")
@@ -642,8 +681,8 @@ else:
             lcol, dcol = st.columns(2)
             if lcol.button("Load snapshot"):
                 try:
-                    _open_job(storage.load_snapshot(job.name, snap_to_load))
-                    _save()
+                    _open_job(storage.load_snapshot(job.name, snap_to_load), st.session_state.job_saved)
+                    _save()  # replaces the current state, so it's checked like any other edit
                     st.rerun()
                 except Exception as e:
                     st.error(f"Couldn't load snapshot '{snap_to_load}': {e}")

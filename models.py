@@ -174,8 +174,8 @@ def _mergeable_sequence_for(rig_name: str, bay_name: str) -> dict | None:
 
 def merged_bay_name(bay_names: list[str]) -> str:
     """A readable name for a merge group, e.g. ["Pipe Bay 2", "Pipe Bay 3"] -> "Pipe Bay 2-3"."""
-    parsed = [re.match(r"^(.*?)(\d+)$", n) for n in bay_names]
-    if all(parsed) and len({m.group(1) for m in parsed}) == 1:
+    parsed = [m for n in bay_names if (m := re.match(r"^(.*?)(\d+)$", n))]
+    if len(parsed) == len(bay_names) and len({m.group(1) for m in parsed}) == 1:
         prefix = parsed[0].group(1)
         nums = [m.group(2) for m in parsed]
         return f"{prefix}{nums[0]}-{nums[-1]}" if len(nums) > 1 else f"{prefix}{nums[0]}"
@@ -211,9 +211,10 @@ def merge_bays(job: Job, bay_names: list[str]) -> None:
     if error:
         raise ValueError(error)
     seq = _mergeable_sequence_for(job.rig_name, bay_names[0])
+    assert seq is not None  # can_merge checked it
     post_thickness_m = seq["post_thickness_m"]
     ordered_names = [n for n in seq["bays"] if n in bay_names]
-    component_bays = [job.get_bay(n) for n in ordered_names]
+    component_bays = [b for n in ordered_names if (b := job.get_bay(n)) is not None]
     n = len(component_bays)
     merged_length_m = sum(b.length_m for b in component_bays) + post_thickness_m * (n - 1)
     merged_height_m = component_bays[0].height_m
@@ -384,14 +385,11 @@ def effective_row_capacity(bay: Bay, diameter_in: float) -> int:
     return override if override is not None else formula_row_capacity(bay, diameter_in)
 
 
-def set_row_capacity_override(bay: Bay, diameter_in: float, max_per_row: int) -> None:
-    if max_per_row < 1:
-        raise ValueError("Max per layer must be at least 1.")
-    bay.row_capacity_overrides[diameter_in] = max_per_row
-
-
 def clear_row_capacity_override(bay: Bay, diameter_in: float) -> None:
-    bay.row_capacity_overrides.pop(diameter_in, None)
+    """Go back to the formula's joints-per-layer for this size — if what's stacked still fits."""
+    overrides = {d: n for d, n in bay.row_capacity_overrides.items() if d != diameter_in}
+    _check_fits(replace(bay, row_capacity_overrides=overrides), bay.joints, "Going back to automatic")
+    bay.row_capacity_overrides = overrides
 
 
 def _row_height_m(row: list[Joint]) -> float:
@@ -444,12 +442,25 @@ def _checked_size(type_name: str, category: str, diameter_in: float) -> tuple[st
 
 
 def add_joints(
-    bay: Bay, type_name: str, count: int, category: str, diameter_in: float, label: str | None = None
+    bay: Bay,
+    type_name: str,
+    count: int,
+    category: str,
+    diameter_in: float,
+    label: str | None = None,
+    max_per_layer: int | None = None,
 ) -> None:
+    """Stack `count` new joints on top. `max_per_layer`, if given, becomes this size's per-layer
+    override in the bay — but only if the joints then fit, so a refused add changes nothing."""
     if count < 1:
         raise ValueError("Count must be at least 1.")
+    if max_per_layer is not None and max_per_layer < 1:
+        raise ValueError("Max per layer must be at least 1.")
     category, diameter_in = _checked_size(type_name, category, diameter_in)
     _check_no_mixing(bay, category == pipe_sizes.RISER)
+    overrides = dict(bay.row_capacity_overrides)
+    if max_per_layer is not None:
+        overrides[diameter_in] = max_per_layer
     ordered = sorted(bay.joints, key=lambda j: j.order)
     next_order = (ordered[-1].order if ordered else 0) + 1
     new_joints = [
@@ -463,7 +474,12 @@ def add_joints(
         for i in range(count)
     ]
     hypothetical = ordered + new_joints
-    _check_fits(bay, hypothetical, f"Adding {count} × {pipe_sizes.size_label(category, diameter_in)}")
+    _check_fits(
+        replace(bay, row_capacity_overrides=overrides),
+        hypothetical,
+        f"Adding {count} × {pipe_sizes.size_label(category, diameter_in)}",
+    )
+    bay.row_capacity_overrides = overrides
     bay.joints = hypothetical
 
 
